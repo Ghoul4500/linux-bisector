@@ -173,3 +173,44 @@ Problems 1 and 2 are exactly what the `./install.sh verify` step in the bisect l
 - After reboot, `./install.sh verify` reads `.expected_commit`, reads the running `uname -r`, and exits non-zero unless `uname -r` contains `-g<expected>-`. Use it as a hard gate: if verify fails, **do not** run `git bisect good`/`bad` — fix the bootloader / re-pick the linux-bisector entry / rebuild, then verify again.
 
 `build.sh` also appends every built commit's full SHA to `built_commits.txt`, giving you a running log of what was actually compiled across the bisect — useful if you ever lose track of which step you're on, or want to retroactively check whether a step really got rebuilt.
+
+## Sending a lore series as a PR
+
+`lore-pr.sh` takes a lore.kernel.org link (or bare message-id) and opens a pull request from it,
+so a series sent to the list does not have to be re-applied and PR'd by hand.
+
+Needs `b4`, `gh` (logged in) and the `linux` clone with remotes for the target repos and for linux-next.
+
+Pick a config and copy it to `lore-pr.conf` (gitignored), then edit the fork and path lines:
+
+```sh
+cp lore-pr.conf.ogc lore-pr.conf       # OGC linux / linux-unstable targets
+# or
+cp lore-pr.conf.example lore-pr.conf   # a single target on your own fork
+```
+
+Then:
+
+```sh
+./lore-pr.sh -n https://lore.kernel.org/all/<message-id>/   # dry run: apply and show the plan
+./lore-pr.sh https://lore.kernel.org/all/<message-id>/      # push and open the PR (asks first)
+./lore-pr.sh -T unstable ...                                 # another target from the config
+```
+
+For every patch in the series the script first looks for the commit in linux-next. Commits already there are
+brought over with `git cherry-pick -sex`; patches that only exist on the list are applied with `b4 am -cl`.
+The cover letter becomes the PR body. A series that is already on the base branch is skipped.
+
+The config is plain bash:
+
+- `LORE_PR_TARGETS`: one row per repo PRs are opened against, `key|owner/repo|remote|base|title prefix|fork`.
+  A base of `@auto` picks a branch from `LORE_PR_BRANCH_MAP` by the paths the series touches (the OGC
+  config maps `drivers/platform/x86/asus-*` to `features/asus`, and so on). The prefix, e.g. `[FROM-ML] `,
+  goes on the PR title and on every commit subject.
+- `LORE_PR_FORKS`: named push destinations, `name|owner/repo`. A target's fork column names one of these,
+  or `-` to push straight to the target repo. Override per run with `-H`. The fork has to be in the same
+  network as the target (gregkh/linux for OGC linux, torvalds/linux for linux-unstable); the script
+  checks this before pushing.
+- `LORE_PR_NEXT_REMOTE`: the remote holding linux-next.
+
+`./lore-pr.sh -h` lists the remaining flags (`-b` base, `-B` branch name, `-v` series revision, `-P` subset, `-p` prefix, `-y` no prompts, `-k` keep the worktree).

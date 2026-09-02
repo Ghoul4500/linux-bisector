@@ -8,9 +8,7 @@ basedir=$(cd "$(dirname "$0")" && pwd)
 
 # config
 conf=${LORE_PR_CONF:-$basedir/lore-pr.conf}
-if [ -f "$conf" ]; then
-	. "$conf"
-fi
+[ ! -f "$conf" ] || . "$conf"
 
 : "${LORE_PR_REPO:=$basedir/linux}"
 : "${LORE_PR_NEXT_REMOTE:=}"
@@ -18,6 +16,7 @@ fi
 : "${LORE_PR_NEXT_LOOKBACK:=1 year}"
 : "${LORE_PR_FORKS:=}"
 : "${LORE_PR_TARGET:=}"
+: "${LORE_PR_BRANCH_MAP:=}"
 : "${LORE_PR_TARGETS:=}"
 : "${LORE_PR_BRANCH_PREFIX:=lore/}"
 : "${LORE_PR_WORKTREE:=$basedir/.lore-pr-wt}"
@@ -47,7 +46,8 @@ usage() {
 usage: $(basename "$0") [options] <lore-url-or-message-id>
 
   -T, --to KEY           target from lore-pr.conf (known: $(target_keys))
-  -b, --base BRANCH      PR base branch (default: from the target row)
+  -b, --base BRANCH      PR base branch (default: from the target row; "@auto"
+                         picks one from LORE_PR_BRANCH_MAP by touched paths)
   -H, --head FORK        push through this fork (name from lore-pr.conf, or
                          owner/repo; default: from the target row; "-" pushes
                          to the target repo itself). Known: $(fork_keys)
@@ -241,6 +241,21 @@ fi
 paths=$(grep -oE '^diff --git a/[^ ]+' "$mbx" | sed 's|^diff --git a/||' | sort -u)
 [ -n "$paths" ] || die "series touches no files — refusing to open an empty PR"
 
+auto_note=""
+if [ "$base" = "@auto" ]; then
+	[ -n "$LORE_PR_BRANCH_MAP" ] || die "base is @auto but LORE_PR_BRANCH_MAP is empty"
+	base=""
+	while IFS='|' read -r pat br; do
+		pat=${pat#"${pat%%[![:space:]]*}"}
+		case "$pat" in ''|'#'*) continue ;; esac
+		for p in $paths; do
+			case "$p" in $pat) base=$br; break 2 ;; esac
+		done
+	done <<<"$LORE_PR_BRANCH_MAP"
+	[ -n "$base" ] || die "no LORE_PR_BRANCH_MAP entry matches the touched paths (add a '*|branch' fallback)"
+	auto_note=" (auto)"
+fi
+
 if [ -z "$branch" ]; then
 	slug=$(printf '%s' "$title" \
 		| sed -E 's#^[a-zA-Z0-9_/]+: ##; s#^[a-zA-Z0-9_/-]+: ##' \
@@ -264,7 +279,7 @@ fi
 
 # fetch refs
 note "target" "$base_repo"
-note "base  " "$base"
+note "base  " "${base}${auto_note}"
 note "head  " "${head_repo}:${branch}"
 note "title " "${prefix}${title}"
 note "patches" "${#patch_files[@]} touching $(printf '%s\n' "$paths" | wc -l) file(s)"
@@ -381,8 +396,10 @@ if [ -n "$prefix" ]; then
 		*) printf "%s%s\n" "$LORE_PR_MSG_PREFIX" "$subject" ;;
 		esac
 		cat
-	' "${base_sha}..HEAD" >/dev/null 2>&1 \
-		|| die "could not prefix commit subjects with '$prefix'"
+	' "${base_sha}..HEAD" >"$workdir/filter.log" 2>&1 || {
+		sed 's/^/  /' "$workdir/filter.log" >&2
+		die "could not prefix commit subjects with '$prefix'"
+	}
 	note "prefix" "tagged $(git -C "$LORE_PR_WORKTREE" rev-list --count "${base_sha}..HEAD") commit subject(s) with '$prefix'"
 fi
 

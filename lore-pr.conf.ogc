@@ -1,0 +1,56 @@
+# OGC config: cp lore-pr.conf.ogc lore-pr.conf (gitignored), then edit forks/paths
+LORE_PR_REPO=$HOME/Projects/OGC/linux-bisector/linux
+LORE_PR_NEXT_REMOTE=upstream
+LORE_PR_NEXT_BRANCH=master
+LORE_PR_NEXT_LOOKBACK="1 year"
+
+# name|owner/repo — push destinations, one per upstream network
+# (OpenGamingCollective/linux is a gregkh/linux fork, linux-unstable a torvalds/linux fork)
+LORE_PR_FORKS='
+# greg|YOU/linux-greg
+# torvalds|YOU/linux
+'
+
+# key|owner/repo|remote|base|title prefix|fork  (fork: name, owner/repo, or - for the target itself)
+LORE_PR_TARGETS='
+ogc|OpenGamingCollective/linux|ogc|@auto|[FROM-ML] |-
+unstable|OpenGamingCollective/linux-unstable|unstable|master||-
+'
+LORE_PR_TARGET=ogc
+
+# touched path glob|branch, first match wins; used when base is @auto
+LORE_PR_BRANCH_MAP='
+*drivers/platform/x86/asus-*|features/asus
+*drivers/hid/hid-asus*|features/asus
+*drivers/hid/usbhid/*|features/usb-hid
+*drivers/hid/hid-core.c|features/usb-hid
+*drivers/hid/hid-ayaneo*|features/ayaneo
+*ayn-ec*|features/ayaneo
+*drivers/platform/x86/ayn*|features/ayaneo
+*drivers/hid/hid-msi*|features/msi-claw
+*msi-claw*|features/msi-claw
+*oxpec*|features/onexplayer
+*drivers/hid/hid-oxp*|features/onexplayer
+*onexplayer*|features/onexplayer
+*drivers/platform/x86/lenovo*|features/lenovo
+*ideapad*|features/lenovo
+*think*|features/lenovo
+*drivers/platform/x86/steamdeck*|features/steamdeck
+*hid-steam*|features/steamdeck
+*leds-valve*|features/steammachine
+*steammachine*|features/steammachine
+*drivers/iio/imu/bmi270*|features/bmi270
+*drivers/mmc/*|features/mmc-fixes
+*dmem*|features/dmem-cgroups
+*drm/amd/display*|features/vrr
+*amdgpu*vrr*|features/vrr
+*freesync*|features/vrr
+*kernel/sched/*|features/scheduler
+*drivers/gpu/drm/panel*|features/panels
+*vram*overcommit*|features/vram-overcommit
+*ttm*|features/vram-overcommit
+*|features/fixes
+'
+
+LORE_PR_BRANCH_PREFIX=lore/
+LORE_PR_WORKTREE=$HOME/Projects/OGC/linux-bisector/.lore-pr-wt
