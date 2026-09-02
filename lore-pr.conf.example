@@ -1,0 +1,33 @@
+# lore-pr.sh configuration — copy to lore-pr.conf (gitignored) and edit.
+# Plain bash; every value is exported into the script's environment.
+
+# Local kernel clone with the remotes named below.
+LORE_PR_REPO=$HOME/Projects/OGC/linux-bisector/linux
+
+# Remote/branch holding linux-next, searched for already-merged commits.
+LORE_PR_NEXT_REMOTE=upstream
+LORE_PR_NEXT_BRANCH=master
+LORE_PR_NEXT_LOOKBACK="1 year"
+
+# Forks: named push destinations, "name|owner/repo". A PR head must be in the
+# same fork network as the target, so keep one fork per upstream you deal
+# with (e.g. one forked from torvalds/linux, one from gregkh/linux).
+LORE_PR_FORKS='
+torvalds|Ghoul4500/linux
+# greg|Ghoul4500/linux-greg
+'
+
+# Targets: "key|owner/repo|git remote in LORE_PR_REPO|base branch|title prefix|fork".
+# The prefix is applied to the PR title and to every commit subject; leave it
+# empty for none. The fork is a name from LORE_PR_FORKS, a literal owner/repo,
+# or empty/"-" to push straight to the target repo.
+LORE_PR_TARGETS='
+mine|Ghoul4500/linux|origin|master||-
+# example-greg|SomeOrg/linux|someorg|master|[FROM-ML] |greg
+# example-torvalds|SomeOrg/linux-unstable|someorg-unstable|master||torvalds
+'
+LORE_PR_TARGET=mine
+
+# Branch namespace and worktree location.
+LORE_PR_BRANCH_PREFIX=lore/
+LORE_PR_WORKTREE=$HOME/Projects/OGC/linux-bisector/.lore-pr-wt

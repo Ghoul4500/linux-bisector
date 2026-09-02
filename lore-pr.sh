@@ -1,75 +1,79 @@
 #!/usr/bin/env bash
-# lore-pr.sh — turn a lore.kernel.org patch series into a pull request
-# against one of the OGC kernel repos.
+# lore-pr.sh — turn a lore.kernel.org patch series into a pull request.
 #
 #   ./lore-pr.sh https://lore.kernel.org/platform-driver-x86/20260817....@example.com/
 #
-# No flag  -> OpenGamingCollective/linux      (base auto-detected: features/*)
-# -u       -> OpenGamingCollective/linux-unstable (base: master)
+# For every patch in the series the script first looks for the commit in
+# linux-next. Commits that are already there are brought over with
+# `git cherry-pick -sex`; patches that only exist on the list are applied
+# with `b4 am -cl`.
 #
-# Everything below the CONFIG block is generic; retarget it by editing the
-# tables or by exporting the matching LORE_PR_* variable.
+# Which repos are touched is decided entirely by lore-pr.conf (see
+# lore-pr.conf.example): targets are the repos PRs are opened against, forks
+# are named push destinations, and each target says which fork it uses. The
+# script carries no repo names of its own and never creates repos or forks.
 set -euo pipefail
 
 basedir=$(cd "$(dirname "$0")" && pwd)
 
 # ----------------------------------------------------------------- config --
-: "${LORE_PR_REPO:=$basedir/linux}"          # local kernel clone (for objects)
-: "${LORE_PR_TARGET:=ogc}"                   # default target key
+conf=${LORE_PR_CONF:-$basedir/lore-pr.conf}
+if [ -f "$conf" ]; then
+	# shellcheck disable=SC1090
+	. "$conf"
+fi
+
+: "${LORE_PR_REPO:=$basedir/linux}"          # local kernel clone
+: "${LORE_PR_NEXT_REMOTE:=}"                 # remote holding linux-next
+: "${LORE_PR_NEXT_BRANCH:=master}"           # linux-next branch on that remote
+: "${LORE_PR_NEXT_LOOKBACK:=1 year}"         # how far back to search linux-next
+: "${LORE_PR_FORKS:=}"                       # name|owner/repo (push destinations)
+: "${LORE_PR_TARGET:=}"                      # default target key
+: "${LORE_PR_TARGETS:=}"                     # key|owner/repo|remote|base|prefix|fork
 : "${LORE_PR_BRANCH_PREFIX:=lore/}"          # branch namespace
 : "${LORE_PR_WORKTREE:=$basedir/.lore-pr-wt}"
-: "${LORE_PR_FORK_SUFFIX:=-ogc}"             # name for a same-network fork we create
 
-# target key -> "github repo|git remote|default base|PR title prefix"
-target_row() {
-	case "$1" in
-	ogc)      echo "OpenGamingCollective/linux|ogc|@auto|[FROM-ML] " ;;
-	unstable) echo "OpenGamingCollective/linux-unstable|unstable|master|" ;;
-	*)        return 1 ;;
-	esac
+# Look up "key|rest" rows in a multi-line table: table_row TABLE KEY -> rest
+table_row() {
+	local key=$2 line k rest
+	while IFS= read -r line; do
+		line=${line#"${line%%[![:space:]]*}"}
+		case "$line" in ''|'#'*) continue ;; esac
+		k=${line%%|*}; rest=${line#*|}
+		if [ "$k" = "$key" ]; then printf '%s\n' "$rest"; return 0; fi
+	done <<<"$1"
+	return 1
 }
-
-# Touched paths -> OGC feature branch. First match wins, so order matters.
-guess_feature_branch() {
-	local p=$1
-	case "$p" in
-	*drivers/platform/x86/asus-*|*drivers/hid/hid-asus*) echo features/asus ;;
-	*drivers/hid/usbhid/*|*drivers/hid/hid-core.c*)      echo features/usb-hid ;;
-	*drivers/hid/hid-ayaneo*|*ayn-ec*|*drivers/platform/x86/ayn*) echo features/ayaneo ;;
-	*drivers/hid/hid-msi*|*msi-claw*)                    echo features/msi-claw ;;
-	*oxpec*|*drivers/hid/hid-oxp*|*onexplayer*)          echo features/onexplayer ;;
-	*drivers/platform/x86/lenovo*|*ideapad*|*think*)     echo features/lenovo ;;
-	*drivers/platform/x86/steamdeck*|*hid-steam*)        echo features/steamdeck ;;
-	*leds-valve*|*steammachine*)                         echo features/steammachine ;;
-	*drivers/iio/imu/bmi270*)                            echo features/bmi270 ;;
-	*drivers/mmc/*)                                      echo features/mmc-fixes ;;
-	*dmem*)                                              echo features/dmem-cgroups ;;
-	*drm/amd/display*|*amdgpu*vrr*|*freesync*)           echo features/vrr ;;
-	*kernel/sched/*)                                     echo features/scheduler ;;
-	*drivers/gpu/drm/panel*)                             echo features/panels ;;
-	*vram*overcommit*|*ttm*)                             echo features/vram-overcommit ;;
-	*) echo features/fixes ;;
-	esac
+table_keys() {
+	printf '%s\n' "$1" | sed -E '/^[[:space:]]*(#|$)/d; s/^[[:space:]]*//; s/\|.*//' \
+		| paste -sd, - | sed 's/^$/none/'
 }
+target_row() { table_row "$LORE_PR_TARGETS" "$1"; }
+target_keys() { table_keys "$LORE_PR_TARGETS"; }
+fork_row() { table_row "$LORE_PR_FORKS" "$1"; }
+fork_keys() { table_keys "$LORE_PR_FORKS"; }
 
 # ------------------------------------------------------------------ usage --
 usage() {
 	cat >&2 <<EOF
 usage: $(basename "$0") [options] <lore-url-or-message-id>
 
-  -u, --unstable         target linux-unstable instead of linux
-  -T, --to KEY           target key explicitly (ogc|unstable)
-  -b, --base BRANCH      PR base branch (default: master, or auto for ogc)
+  -T, --to KEY           target from lore-pr.conf (known: $(target_keys))
+  -b, --base BRANCH      PR base branch (default: from the target row)
+  -H, --head FORK        push through this fork (name from lore-pr.conf, or
+                         owner/repo; default: from the target row; "-" pushes
+                         to the target repo itself). Known: $(fork_keys)
   -B, --branch NAME      branch name to create (default: derived from subject)
-  -o, --origin           push to your own fork instead of the org repo
   -v, --version N        pick series revision vN
-  -P, --pick RANGE       cherry-pick a subset, e.g. 1-2,4
-  -p, --prefix STR       PR title prefix (default per target)
-      --no-prefix        no PR title prefix
-  -n, --dry-run          apply patches, show the plan, push nothing
-  -y, --yes              do not prompt before opening the PR
+  -P, --pick RANGE       apply a subset of the series, e.g. 1-2,4
+  -p, --prefix STR       PR/commit title prefix (default: from the target row)
+      --no-prefix        no title prefix
+  -n, --dry-run          apply, show the plan, push nothing
+  -y, --yes              do not prompt before pushing / opening the PR
   -k, --keep             keep the worktree after finishing
   -h, --help             this message
+
+config: $conf
 EOF
 	exit "${1:-2}"
 }
@@ -93,16 +97,15 @@ confirm() {
 
 # ------------------------------------------------------------------- args --
 target=$LORE_PR_TARGET
-base=""; branch=""; use_origin=0; wantver=""; pick=""
+base=""; branch=""; wantver=""; pick=""; head_opt=""
 prefix=""; prefix_set=0; dry=0; assume_yes=0; keep=0; msgid=""
 
 while [ $# -gt 0 ]; do
 	case "$1" in
-	-u|--unstable) target=unstable ;;
 	-T|--to)       target=${2:?}; shift ;;
 	-b|--base)     base=${2:?}; shift ;;
+	-H|--head)     head_opt=${2:?}; shift ;;
 	-B|--branch)   branch=${2:?}; shift ;;
-	-o|--origin)   use_origin=1 ;;
 	-v|--version)  wantver=${2:?}; shift ;;
 	-P|--pick)     pick=${2:?}; shift ;;
 	-p|--prefix)   prefix=${2:?}; prefix_set=1; shift ;;
@@ -120,16 +123,38 @@ done
 [ -n "$msgid" ] || usage
 
 for tool in b4 gh git; do
-	command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed${
-		}$([ "$tool" = b4 ] && echo ' (pacman -S b4, or uv tool install b4)')"
+	command -v "$tool" >/dev/null 2>&1 && continue
+	[ "$tool" != b4 ] || die "b4 is not installed (pacman -S b4, or uv tool install b4)"
+	die "$tool is not installed"
 done
 gh auth status >/dev/null 2>&1 || die "gh is not authenticated; run: gh auth login"
 [ -d "$LORE_PR_REPO/.git" ] || die "not a git repo: $LORE_PR_REPO (set LORE_PR_REPO)"
+[ -n "$LORE_PR_TARGETS" ] || die "no targets configured — copy lore-pr.conf.example to $conf"
+[ -n "$target" ] || die "no target given — use --to KEY or set LORE_PR_TARGET (known: $(target_keys))"
+[ -n "$LORE_PR_NEXT_REMOTE" ] || die "LORE_PR_NEXT_REMOTE is not set (the remote holding linux-next)"
 
-row=$(target_row "$target") || die "unknown target '$target' (known: ogc, unstable)"
-IFS='|' read -r base_repo remote default_base def_prefix <<<"$row"
+row=$(target_row "$target") || die "unknown target '$target' (known: $(target_keys))"
+IFS='|' read -r base_repo remote default_base def_prefix def_fork <<<"$row"
+[ -n "$base_repo" ] && [ -n "$remote" ] && [ -n "$default_base" ] \
+	|| die "malformed target row for '$target': need key|owner/repo|remote|base|prefix|fork"
 [ "$prefix_set" = 1 ] || prefix=$def_prefix
 [ -n "$base" ] || base=$default_base
+
+# Resolve the push destination: a fork name from LORE_PR_FORKS, a literal
+# owner/repo, or "-" / empty for the target repo itself.
+fork=${head_opt:-$def_fork}
+case "$fork" in
+''|-)  head_repo=$base_repo ;;
+*/*)   head_repo=$fork ;;
+*)     head_repo=$(fork_row "$fork") \
+         || die "unknown fork '$fork' (known: $(fork_keys)); add it to LORE_PR_FORKS in $conf" ;;
+esac
+[ -n "$head_repo" ] || die "fork '$fork' has an empty owner/repo in $conf"
+push_url="git@github.com:${head_repo}.git"
+git -C "$LORE_PR_REPO" remote get-url "$remote" >/dev/null 2>&1 \
+	|| die "remote '$remote' for target '$target' does not exist in $LORE_PR_REPO"
+git -C "$LORE_PR_REPO" remote get-url "$LORE_PR_NEXT_REMOTE" >/dev/null 2>&1 \
+	|| die "LORE_PR_NEXT_REMOTE '$LORE_PR_NEXT_REMOTE' does not exist in $LORE_PR_REPO"
 
 # lore URL -> bare message-id
 msgid=${msgid#<}; msgid=${msgid%>}
@@ -158,20 +183,27 @@ trap cleanup EXIT
 
 # ------------------------------------------------------- fetch the series --
 note "series" "$msgid"
+# -c warns when a newer revision of the series exists on the list.
+# -l records a Link: trailer pointing back at the message.
 # -3 makes b4 materialise the patches' pre-image blobs in the repo, which is what
 # lets `git am -3` resolve a series against a base that has since moved on.
-b4_args=(am -o "$workdir" -n series -l -3 --no-partial-reroll)
+b4_args=(am -o "$workdir" -n series -c -l -3 --no-partial-reroll)
 [ -z "$wantver" ] || b4_args+=(-v "$wantver")
 [ -z "$pick" ] || b4_args+=(-P "$pick")
 (cd "$LORE_PR_REPO" && b4 "${b4_args[@]}" "$msgid") >"$workdir/b4.log" 2>&1 || {
 	sed 's/^/  /' "$workdir/b4.log" >&2; die "b4 am failed"
 }
-sed 's/^/  /' "$workdir/b4.log" | grep -E 'Total patches|Cover:|✗|✓' || true
+sed 's/^/  /' "$workdir/b4.log" | grep -iE 'Total patches|Cover:|newer|✗|✓' || true
 
 mbx=$(find "$workdir" -maxdepth 1 -name 'series*.mbx' | head -n1)
 [ -n "$mbx" ] || { sed 's/^/  /' "$workdir/b4.log" >&2; die "b4 produced no patches"; }
 cover=$(find "$workdir" -maxdepth 1 -name 'series*.cover' | head -n1)
-n_patches=$(grep -c '^From ' "$mbx" || true)
+
+# One file per patch, in series order, so each can be handled on its own.
+mkdir -p "$workdir/split"
+git mailsplit -o"$workdir/split" "$mbx" >/dev/null
+mapfile -t patch_files < <(find "$workdir/split" -maxdepth 1 -type f | sort)
+[ "${#patch_files[@]}" -gt 0 ] || die "could not split the mbox"
 
 # ----------------------------------------------------- title, body, paths --
 # RFC822 headers may be folded across lines; rejoin them before reading Subject.
@@ -216,28 +248,21 @@ clean_cover() {
 	END { while (n > 0 && buf[n-1] ~ /^[[:space:]]*$/) n--
 	      for (i = 0; i < n; i++) print buf[i] }'
 }
-
+header() { unfold_headers "$1" | sed -n "s/^$2: //p" | head -n1; }
+patch_msgid() { header "$1" 'Message-I[dD]' | sed 's/^<//; s/>.*//'; }
+patch_subject() { header "$1" Subject | strip_tag; }   # minus the [PATCH ...] tag
 
 if [ -n "$cover" ]; then
-	subject=$(unfold_headers "$cover" | sed -n 's/^Subject: //p' | head -n1)
+	title=$(header "$cover" Subject | strip_tag)
 	body=$(sed '1,/^$/d' "$cover")
 else
-	subject=$(unfold_headers "$mbx" | sed -n 's/^Subject: //p' | head -n1)
+	title=$(patch_subject "${patch_files[0]}")
 	body=""
 fi
-# strip the [PATCH ...] tag that lore/b4 keeps on the subject line
-title=$(printf '%s' "$subject" | strip_tag)
 [ -n "$title" ] || die "could not determine a title for the series"
 
 paths=$(grep -oE '^diff --git a/[^ ]+' "$mbx" | sed 's|^diff --git a/||' | sort -u)
 [ -n "$paths" ] || die "series touches no files — refusing to open an empty PR"
-
-if [ "$base" = "@auto" ]; then
-	base=$(guess_feature_branch "$(printf '%s\n' "$paths" | tr '\n' ' ')")
-	auto_note=" (auto)"
-else
-	auto_note=""
-fi
 
 if [ -z "$branch" ]; then
 	slug=$(printf '%s' "$title" \
@@ -250,90 +275,134 @@ if [ -z "$branch" ]; then
 	branch="${LORE_PR_BRANCH_PREFIX}${slug}"
 fi
 
-# ------------------------------------------------------- resolve head repo --
+# ---------------------------------------------------------- same network? --
+# A PR head has to live in the base repo's fork network. Catch a fork named
+# for the wrong upstream before anything is pushed.
 network() { gh api "repos/$1" --jq '.source.full_name // .full_name' 2>/dev/null; }
-
-base_net=$(network "$base_repo") || die "cannot read $base_repo via gh"
-head_repo=$base_repo
-push_url="git@github.com:${base_repo}.git"
-
-if [ "$use_origin" = 1 ]; then
-	gh_user=$(gh api user --jq .login)
-	cand=$(git -C "$LORE_PR_REPO" remote get-url origin 2>/dev/null \
-		| sed -E 's#^.*github\.com[:/]##; s#\.git$##') || cand=""
-	head_repo=""
-	if [ -n "$cand" ] && [ "$(network "$cand" || true)" = "$base_net" ]; then
-		head_repo=$cand
-	else
-		[ -z "$cand" ] || warn "$cand is in the ${cand:+$(network "$cand" || echo unknown)} network, but $base_repo is in $base_net"
-		alt="${gh_user}/$(basename "$base_repo")${LORE_PR_FORK_SUFFIX}"
-		if [ "$(network "$alt" 2>/dev/null || true)" = "$base_net" ]; then
-			head_repo=$alt
-			note "fork" "reusing $alt"
-		else
-			printf 'No fork of %s exists under %s.\n' "$base_repo" "$gh_user" >&2
-			if confirm "Create $alt now?"; then
-				gh repo fork "$base_repo" --fork-name "$(basename "$alt")" --clone=false --remote=false \
-					|| die "gh repo fork failed"
-				head_repo=$alt
-			else
-				die "--origin into $base_repo needs a fork in the $base_net network; create one with:
-       gh repo fork $base_repo --fork-name $(basename "$alt") --clone=false"
-			fi
-		fi
-	fi
-	push_url="git@github.com:${head_repo}.git"
+if [ "$head_repo" != "$base_repo" ]; then
+	base_net=$(network "$base_repo") || die "cannot read $base_repo via gh"
+	head_net=$(network "$head_repo") || die "cannot read $head_repo via gh"
+	[ "$base_net" = "$head_net" ] \
+		|| die "$head_repo is a fork of $head_net, but $base_repo is a fork of $base_net
+       pick a fork in the right network with --head (known: $(fork_keys))"
 fi
 
-# ------------------------------------------------------------ apply series --
+# ------------------------------------------------------------- fetch refs --
 note "target" "$base_repo"
-note "base  " "${base}${auto_note}"
+note "base  " "$base"
 note "head  " "${head_repo}:${branch}"
 note "title " "${prefix}${title}"
-note "patches" "$n_patches touching $(printf '%s\n' "$paths" | wc -l) file(s)"
+note "patches" "${#patch_files[@]} touching $(printf '%s\n' "$paths" | wc -l) file(s)"
 
 git -C "$LORE_PR_REPO" fetch --quiet "$remote" "$base" \
-	|| die "cannot fetch $base from remote '$remote' — is it configured in $LORE_PR_REPO?"
+	|| die "cannot fetch $base from remote '$remote'"
 base_sha=$(git -C "$LORE_PR_REPO" rev-parse FETCH_HEAD)
 
-# The OGC branches carry these patches under their original subject, so a series
-# that has already landed is cheap to spot — and is the common case for a resend.
-series_subjects=$(unfold_headers "$mbx" | sed -n 's/^Subject: //p' | strip_tag)
+note "next  " "fetching ${LORE_PR_NEXT_REMOTE}/${LORE_PR_NEXT_BRANCH}"
+git -C "$LORE_PR_REPO" fetch --quiet "$LORE_PR_NEXT_REMOTE" "$LORE_PR_NEXT_BRANCH" \
+	|| die "cannot fetch $LORE_PR_NEXT_BRANCH from remote '$LORE_PR_NEXT_REMOTE'"
+next_sha=$(git -C "$LORE_PR_REPO" rev-parse FETCH_HEAD)
+
+# -------------------------------------------------- already on the base? --
+# Branches carry these patches under their original subject, so a series that
+# has already landed is cheap to spot — and is the common case for a resend.
 base_subjects=$(git -C "$LORE_PR_REPO" log -n 500 --format=%s "$base_sha" | strip_tag)
 present=0; missing=0
-while IFS= read -r subj; do
+for f in "${patch_files[@]}"; do
+	subj=$(patch_subject "$f")
 	[ -n "$subj" ] || continue
 	if printf '%s\n' "$base_subjects" | grep -qxF "$subj"; then
 		present=$((present + 1))
 	else
 		missing=$((missing + 1))
 	fi
-done <<<"$series_subjects"
-
+done
 if [ "$missing" = 0 ] && [ "$present" -gt 0 ]; then
 	note "already" "all $present patch(es) are on ${base_repo}:${base} — nothing to do"
 	exit 0
 fi
 [ "$present" = 0 ] || warn "$present of $((present + missing)) patch(es) already on $base — expect conflicts"
 
+# ------------------------------------------------- look up in linux-next --
+# A patch merged with b4 carries its message-id in a Link:/patch.msgid.link
+# trailer; match on that first, and fall back to an exact subject match.
+find_in_next() {
+	local mid=$1 subj=$2 sha
+	if [ -n "$mid" ]; then
+		sha=$(git -C "$LORE_PR_REPO" log -n1 --format=%H -F --grep="$mid" \
+			--since="$LORE_PR_NEXT_LOOKBACK" "${base_sha}..${next_sha}")
+		[ -z "$sha" ] || { printf '%s\n' "$sha"; return 0; }
+	fi
+	if [ -n "$subj" ]; then
+		sha=$(git -C "$LORE_PR_REPO" log --format='%H%x09%s' -F --grep="$subj" \
+			--since="$LORE_PR_NEXT_LOOKBACK" "${base_sha}..${next_sha}" \
+			| awk -F'\t' -v s="$subj" '$2 == s { print $1; exit }')
+		[ -z "$sha" ] || { printf '%s\n' "$sha"; return 0; }
+	fi
+	return 1
+}
+
+picks=()      # shas found in linux-next, series order
+ml_only=()    # split files that have to come from the list
+for f in "${patch_files[@]}"; do
+	mid=$(patch_msgid "$f"); subj=$(patch_subject "$f")
+	if sha=$(find_in_next "$mid" "$subj"); then
+		picks+=("$sha")
+		note "next  " "${sha:0:12} $subj"
+	else
+		ml_only+=("$f")
+		note "list  " "$subj"
+	fi
+done
+
+case "${#picks[@]}/${#ml_only[@]}" in
+*/0) source_note="cherry-picked from linux-next (${LORE_PR_NEXT_REMOTE}/${LORE_PR_NEXT_BRANCH})" ;;
+0/*) source_note="applied with \`b4 am\` from the mailing list" ;;
+*)   source_note="${#picks[@]} commit(s) cherry-picked from linux-next, ${#ml_only[@]} applied with \`b4 am\` from the mailing list"
+     warn "series is only partially in linux-next — mixing cherry-pick and b4 am" ;;
+esac
+
+# ------------------------------------------------------------- worktree --
 git -C "$LORE_PR_REPO" worktree remove --force "$LORE_PR_WORKTREE" 2>/dev/null || true
 git -C "$LORE_PR_REPO" branch -D "$branch" 2>/dev/null || true
 note "worktree" "checking out $base at ${base_sha:0:12} (this takes a moment)"
 git -C "$LORE_PR_REPO" worktree add --quiet -b "$branch" "$LORE_PR_WORKTREE" "$base_sha"
 wt_added=1
 
-if ! git -C "$LORE_PR_WORKTREE" am --quiet -3 "$mbx" 2>"$workdir/am.log"; then
-	sed 's/^/  /' "$workdir/am.log" >&2
-	git -C "$LORE_PR_WORKTREE" am --show-current-patch=diff 2>/dev/null | head -20 >&2 || true
-	git -C "$LORE_PR_WORKTREE" am --abort 2>/dev/null || true
+leave_worktree() {
 	keep=1
-	die "series does not apply cleanly onto ${base_repo}:${base}
+	die "$1
        the worktree is left at $LORE_PR_WORKTREE to fix by hand
        or retry with a different base, e.g. --base master"
+}
+
+if [ "${#picks[@]}" -gt 0 ]; then
+	# -s sign off, -e edit each message, -x record the origin commit.
+	cp_flags=(-s -x); cp_in=/dev/null
+	if [ -t 0 ] && [ -t 1 ]; then
+		cp_flags+=(-e); cp_in=/dev/tty
+	else
+		warn "no terminal — cherry-picking without -e"
+	fi
+	if ! git -C "$LORE_PR_WORKTREE" cherry-pick "${cp_flags[@]}" "${picks[@]}" <"$cp_in" 2>"$workdir/cp.log"; then
+		sed 's/^/  /' "$workdir/cp.log" >&2
+		git -C "$LORE_PR_WORKTREE" status --short 2>/dev/null | head -20 >&2 || true
+		git -C "$LORE_PR_WORKTREE" cherry-pick --abort 2>/dev/null || true
+		leave_worktree "cherry-pick from linux-next does not apply cleanly onto ${base_repo}:${base}"
+	fi
 fi
-# The OGC feature branches carry the marker on the commits themselves, not just
-# on the PR title, so rewrite the subjects we just applied. Idempotent, and a
-# no-op for targets with an empty prefix (linux-unstable).
+
+if [ "${#ml_only[@]}" -gt 0 ]; then
+	if ! git -C "$LORE_PR_WORKTREE" am --quiet -3 -s "${ml_only[@]}" 2>"$workdir/am.log"; then
+		sed 's/^/  /' "$workdir/am.log" >&2
+		git -C "$LORE_PR_WORKTREE" am --show-current-patch=diff 2>/dev/null | head -20 >&2 || true
+		git -C "$LORE_PR_WORKTREE" am --abort 2>/dev/null || true
+		leave_worktree "series does not apply cleanly onto ${base_repo}:${base}"
+	fi
+fi
+
+# Optionally tag every commit subject with the target's prefix. Idempotent,
+# and a no-op for targets with an empty prefix.
 if [ -n "$prefix" ]; then
 	FILTER_BRANCH_SQUELCH_WARNING=1 LORE_PR_MSG_PREFIX="$prefix" \
 	git -C "$LORE_PR_WORKTREE" filter-branch -f --msg-filter '
@@ -354,8 +423,8 @@ note "applied" "$applied commit(s) cleanly onto $base"
 summary=""
 [ -z "$body" ] || summary=$(printf '%s\n' "$body" | clean_cover)
 [ -n "$summary" ] || summary=$(git -C "$LORE_PR_WORKTREE" log --reverse --format='- %s' "${base_sha}..HEAD")
-pr_body=$(printf '%s\n\n---\n\nApplied with `b4` from the mailing list.\nLink: https://lore.kernel.org/all/%s/\n' \
-	"$summary" "$msgid")
+pr_body=$(printf '%s\n\n---\n\nSource: %s.\nLink: https://lore.kernel.org/all/%s/\n' \
+	"$summary" "$source_note" "$msgid")
 
 if [ "$dry" = 1 ]; then
 	printf '\n\033[33mdry run\033[0m — nothing pushed. Worktree: %s\n' "$LORE_PR_WORKTREE"

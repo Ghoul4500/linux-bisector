@@ -6,3 +6,4 @@ built_commits.txt
 .expected_commit
 .lore-pr-wt/
 patches
+lore-pr.conf
