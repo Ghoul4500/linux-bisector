@@ -1,39 +1,27 @@
 #!/usr/bin/env bash
-# lore-pr.sh — turn a lore.kernel.org patch series into a pull request.
-#
-#   ./lore-pr.sh https://lore.kernel.org/platform-driver-x86/20260817....@example.com/
-#
-# For every patch in the series the script first looks for the commit in
-# linux-next. Commits that are already there are brought over with
-# `git cherry-pick -sex`; patches that only exist on the list are applied
-# with `b4 am -cl`.
-#
-# Which repos are touched is decided entirely by lore-pr.conf (see
-# lore-pr.conf.example): targets are the repos PRs are opened against, forks
-# are named push destinations, and each target says which fork it uses. The
-# script carries no repo names of its own and never creates repos or forks.
+# lore-pr.sh <lore-url-or-message-id>: open a PR from a lore series.
+# Commits already in linux-next are cherry-picked (-sex), the rest b4 am'd.
+# Repos come from lore-pr.conf (see lore-pr.conf.example).
 set -euo pipefail
 
 basedir=$(cd "$(dirname "$0")" && pwd)
 
-# ----------------------------------------------------------------- config --
+# config
 conf=${LORE_PR_CONF:-$basedir/lore-pr.conf}
 if [ -f "$conf" ]; then
-	# shellcheck disable=SC1090
 	. "$conf"
 fi
 
-: "${LORE_PR_REPO:=$basedir/linux}"          # local kernel clone
-: "${LORE_PR_NEXT_REMOTE:=}"                 # remote holding linux-next
-: "${LORE_PR_NEXT_BRANCH:=master}"           # linux-next branch on that remote
-: "${LORE_PR_NEXT_LOOKBACK:=1 year}"         # how far back to search linux-next
-: "${LORE_PR_FORKS:=}"                       # name|owner/repo (push destinations)
-: "${LORE_PR_TARGET:=}"                      # default target key
-: "${LORE_PR_TARGETS:=}"                     # key|owner/repo|remote|base|prefix|fork
-: "${LORE_PR_BRANCH_PREFIX:=lore/}"          # branch namespace
+: "${LORE_PR_REPO:=$basedir/linux}"
+: "${LORE_PR_NEXT_REMOTE:=}"
+: "${LORE_PR_NEXT_BRANCH:=master}"
+: "${LORE_PR_NEXT_LOOKBACK:=1 year}"
+: "${LORE_PR_FORKS:=}"
+: "${LORE_PR_TARGET:=}"
+: "${LORE_PR_TARGETS:=}"
+: "${LORE_PR_BRANCH_PREFIX:=lore/}"
 : "${LORE_PR_WORKTREE:=$basedir/.lore-pr-wt}"
 
-# Look up "key|rest" rows in a multi-line table: table_row TABLE KEY -> rest
 table_row() {
 	local key=$2 line k rest
 	while IFS= read -r line; do
@@ -53,7 +41,7 @@ target_keys() { table_keys "$LORE_PR_TARGETS"; }
 fork_row() { table_row "$LORE_PR_FORKS" "$1"; }
 fork_keys() { table_keys "$LORE_PR_FORKS"; }
 
-# ------------------------------------------------------------------ usage --
+# usage
 usage() {
 	cat >&2 <<EOF
 usage: $(basename "$0") [options] <lore-url-or-message-id>
@@ -82,7 +70,6 @@ die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 note() { printf '\033[36m%s\033[0m %s\n' "$1" "${2-}"; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
 
-# Ask before anything that touches a remote. Never blocks when there is no tty.
 confirm() {
 	local reply
 	[ "${assume_yes:-0}" != 1 ] || return 0
@@ -95,7 +82,7 @@ confirm() {
 	case "$reply" in [yY]*) return 0 ;; *) return 1 ;; esac
 }
 
-# ------------------------------------------------------------------- args --
+# args
 target=$LORE_PR_TARGET
 base=""; branch=""; wantver=""; pick=""; head_opt=""
 prefix=""; prefix_set=0; dry=0; assume_yes=0; keep=0; msgid=""
@@ -140,8 +127,6 @@ IFS='|' read -r base_repo remote default_base def_prefix def_fork <<<"$row"
 [ "$prefix_set" = 1 ] || prefix=$def_prefix
 [ -n "$base" ] || base=$default_base
 
-# Resolve the push destination: a fork name from LORE_PR_FORKS, a literal
-# owner/repo, or "-" / empty for the target repo itself.
 fork=${head_opt:-$def_fork}
 case "$fork" in
 ''|-)  head_repo=$base_repo ;;
@@ -156,7 +141,6 @@ git -C "$LORE_PR_REPO" remote get-url "$remote" >/dev/null 2>&1 \
 git -C "$LORE_PR_REPO" remote get-url "$LORE_PR_NEXT_REMOTE" >/dev/null 2>&1 \
 	|| die "LORE_PR_NEXT_REMOTE '$LORE_PR_NEXT_REMOTE' does not exist in $LORE_PR_REPO"
 
-# lore URL -> bare message-id
 msgid=${msgid#<}; msgid=${msgid%>}
 msgid=${msgid%%#*}
 case "$msgid" in
@@ -168,7 +152,7 @@ https://*|http://*)
 esac
 [ -n "$msgid" ] || die "could not extract a message-id from the argument"
 
-# ---------------------------------------------------------------- cleanup --
+# cleanup
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/lore-pr.XXXXXX")
 wt_added=0
 cleanup() {
@@ -181,12 +165,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ------------------------------------------------------- fetch the series --
+# fetch the series
 note "series" "$msgid"
-# -c warns when a newer revision of the series exists on the list.
-# -l records a Link: trailer pointing back at the message.
-# -3 makes b4 materialise the patches' pre-image blobs in the repo, which is what
-# lets `git am -3` resolve a series against a base that has since moved on.
+# -3 fetches the pre-image blobs so git am -3 can resolve against a moved base
 b4_args=(am -o "$workdir" -n series -c -l -3 --no-partial-reroll)
 [ -z "$wantver" ] || b4_args+=(-v "$wantver")
 [ -z "$pick" ] || b4_args+=(-P "$pick")
@@ -199,14 +180,13 @@ mbx=$(find "$workdir" -maxdepth 1 -name 'series*.mbx' | head -n1)
 [ -n "$mbx" ] || { sed 's/^/  /' "$workdir/b4.log" >&2; die "b4 produced no patches"; }
 cover=$(find "$workdir" -maxdepth 1 -name 'series*.cover' | head -n1)
 
-# One file per patch, in series order, so each can be handled on its own.
 mkdir -p "$workdir/split"
 git mailsplit -o"$workdir/split" "$mbx" >/dev/null
 mapfile -t patch_files < <(find "$workdir/split" -maxdepth 1 -type f | sort)
 [ "${#patch_files[@]}" -gt 0 ] || die "could not split the mbox"
 
-# ----------------------------------------------------- title, body, paths --
-# RFC822 headers may be folded across lines; rejoin them before reading Subject.
+# title, body, paths
+# rejoin folded headers
 unfold_headers() {
 	awk '
 	BEGIN { inh = 1; held = "" }
@@ -223,11 +203,8 @@ unfold_headers() {
 }
 strip_tag() { sed -E 's/^(\[[^]]*\][[:space:]]*)+//'; }
 
-# A cover letter is an email: it ends with a diffstat, a base-commit line and a
-# git signature. GitHub renders its own diffstat, the one-space indent mangles
-# under markdown, and the "-- " right below base-commit is a setext underline
-# that turns that line into a heading. Cut the lot, and promote the shortlog's
-# indented subjects to a real markdown list.
+# drop diffstat/base-commit/signature ("-- " is a markdown underline) and
+# turn the indented shortlog into a list
 clean_cover() {
 	awk '
 	/^-- $/ { exit }
@@ -250,7 +227,7 @@ clean_cover() {
 }
 header() { unfold_headers "$1" | sed -n "s/^$2: //p" | head -n1; }
 patch_msgid() { header "$1" 'Message-I[dD]' | sed 's/^<//; s/>.*//'; }
-patch_subject() { header "$1" Subject | strip_tag; }   # minus the [PATCH ...] tag
+patch_subject() { header "$1" Subject | strip_tag; }
 
 if [ -n "$cover" ]; then
 	title=$(header "$cover" Subject | strip_tag)
@@ -275,9 +252,7 @@ if [ -z "$branch" ]; then
 	branch="${LORE_PR_BRANCH_PREFIX}${slug}"
 fi
 
-# ---------------------------------------------------------- same network? --
-# A PR head has to live in the base repo's fork network. Catch a fork named
-# for the wrong upstream before anything is pushed.
+# same network?
 network() { gh api "repos/$1" --jq '.source.full_name // .full_name' 2>/dev/null; }
 if [ "$head_repo" != "$base_repo" ]; then
 	base_net=$(network "$base_repo") || die "cannot read $base_repo via gh"
@@ -287,7 +262,7 @@ if [ "$head_repo" != "$base_repo" ]; then
        pick a fork in the right network with --head (known: $(fork_keys))"
 fi
 
-# ------------------------------------------------------------- fetch refs --
+# fetch refs
 note "target" "$base_repo"
 note "base  " "$base"
 note "head  " "${head_repo}:${branch}"
@@ -303,9 +278,7 @@ git -C "$LORE_PR_REPO" fetch --quiet "$LORE_PR_NEXT_REMOTE" "$LORE_PR_NEXT_BRANC
 	|| die "cannot fetch $LORE_PR_NEXT_BRANCH from remote '$LORE_PR_NEXT_REMOTE'"
 next_sha=$(git -C "$LORE_PR_REPO" rev-parse FETCH_HEAD)
 
-# -------------------------------------------------- already on the base? --
-# Branches carry these patches under their original subject, so a series that
-# has already landed is cheap to spot — and is the common case for a resend.
+# already on the base?
 base_subjects=$(git -C "$LORE_PR_REPO" log -n 500 --format=%s "$base_sha" | strip_tag)
 present=0; missing=0
 for f in "${patch_files[@]}"; do
@@ -323,9 +296,8 @@ if [ "$missing" = 0 ] && [ "$present" -gt 0 ]; then
 fi
 [ "$present" = 0 ] || warn "$present of $((present + missing)) patch(es) already on $base — expect conflicts"
 
-# ------------------------------------------------- look up in linux-next --
-# A patch merged with b4 carries its message-id in a Link:/patch.msgid.link
-# trailer; match on that first, and fall back to an exact subject match.
+# look up in linux-next
+# by Link: message-id first, then exact subject
 find_in_next() {
 	local mid=$1 subj=$2 sha
 	if [ -n "$mid" ]; then
@@ -362,7 +334,7 @@ case "${#picks[@]}/${#ml_only[@]}" in
      warn "series is only partially in linux-next — mixing cherry-pick and b4 am" ;;
 esac
 
-# ------------------------------------------------------------- worktree --
+# worktree
 git -C "$LORE_PR_REPO" worktree remove --force "$LORE_PR_WORKTREE" 2>/dev/null || true
 git -C "$LORE_PR_REPO" branch -D "$branch" 2>/dev/null || true
 note "worktree" "checking out $base at ${base_sha:0:12} (this takes a moment)"
@@ -377,7 +349,6 @@ leave_worktree() {
 }
 
 if [ "${#picks[@]}" -gt 0 ]; then
-	# -s sign off, -e edit each message, -x record the origin commit.
 	cp_flags=(-s -x); cp_in=/dev/null
 	if [ -t 0 ] && [ -t 1 ]; then
 		cp_flags+=(-e); cp_in=/dev/tty
@@ -401,8 +372,6 @@ if [ "${#ml_only[@]}" -gt 0 ]; then
 	fi
 fi
 
-# Optionally tag every commit subject with the target's prefix. Idempotent,
-# and a no-op for targets with an empty prefix.
 if [ -n "$prefix" ]; then
 	FILTER_BRANCH_SQUELCH_WARNING=1 LORE_PR_MSG_PREFIX="$prefix" \
 	git -C "$LORE_PR_WORKTREE" filter-branch -f --msg-filter '
@@ -433,7 +402,7 @@ if [ "$dry" = 1 ]; then
 	exit 0
 fi
 
-# -------------------------------------------------------------- push + PR --
+# push + PR
 push_flags=()
 if git ls-remote --exit-code --heads "$push_url" "$branch" >/dev/null 2>&1; then
 	warn "$head_repo already has branch $branch"
